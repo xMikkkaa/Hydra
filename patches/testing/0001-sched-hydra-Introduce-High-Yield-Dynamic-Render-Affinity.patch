@@ -1,24 +1,24 @@
-From 8efcd87812100f328e6133dd764a744ec5f3ccb5 Mon Sep 17 00:00:00 2001
+From 8d5470df9094290d69861b947a52deaffda82c2c Mon Sep 17 00:00:00 2001
 From: xMikkkaa <xMikkkaa@users.noreply.github.com>
 Date: Wed, 5 Aug 2026 08:32:13 +0800
-Subject: [PATCH] sched: hydra: Implement O(1) dead thread pruning and fix TID
- reuse
+Subject: [PATCH] sched: hydra: Refactor lifecycle management and fix race
+ conditions
 
 ---
- include/linux/sched/hydra.h |  30 ++
+ include/linux/sched/hydra.h |  31 ++
  init/Kconfig                |   4 +
  kernel/sched/Makefile       |   1 +
- kernel/sched/hydra.c        | 546 ++++++++++++++++++++++++++++++++++++
- 4 files changed, 581 insertions(+)
+ kernel/sched/hydra.c        | 556 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 592 insertions(+)
  create mode 100644 include/linux/sched/hydra.h
  create mode 100644 kernel/sched/hydra.c
 
 diff --git a/include/linux/sched/hydra.h b/include/linux/sched/hydra.h
 new file mode 100644
-index 0000000..5c961ef
+index 0000000..dbdcf0a
 --- /dev/null
 +++ b/include/linux/sched/hydra.h
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,31 @@
 +#ifndef _KERNEL_SCHED_HYDRA_H
 +#define _KERNEL_SCHED_HYDRA_H
 +
@@ -28,12 +28,13 @@ index 0000000..5c961ef
 +
 +#define SCHED_HYDRA_AUTHOR   "xMikkkaa"
 +#define SCHED_HYDRA_PROGNAME "HYDRA Game Thread Optimizer"
-+#define SCHED_HYDRA_VERSION  "0.2"
++#define SCHED_HYDRA_VERSION  "0.3"
 +
 +#define HYDRA_MAX_TRACKED_THREADS 64
 +
 +struct hydra_thread_state {
 +	pid_t tid;
++	u64 start_time;
 +	int original_nice;
 +	cpumask_t original_mask;
 +};
@@ -70,10 +71,10 @@ index 23971e4..eeeed68 100644
 +obj-$(CONFIG_SCHED_HYDRA) += hydra.o
 diff --git a/kernel/sched/hydra.c b/kernel/sched/hydra.c
 new file mode 100644
-index 0000000..2ace135
+index 0000000..083d80c
 --- /dev/null
 +++ b/kernel/sched/hydra.c
-@@ -0,0 +1,546 @@
+@@ -0,0 +1,556 @@
 +/*
 + * High-Yield Dynamic Render Affinity (HYDRA) Thread Optimizer
 + * Copyright (C) 2026 xMikkkaa
@@ -115,7 +116,7 @@ index 0000000..2ace135
 +
 +static struct work_struct hydra_fork_work;
 +static struct work_struct hydra_exit_work;
-+static atomic_t hydra_exit_pending = ATOMIC_INIT(0);
++static atomic_t hydra_exit_pid = ATOMIC_INIT(0);
 +
 +static struct delayed_work hydra_smart_dwork;
 +static bool hydra_smart_running = false;
@@ -182,7 +183,7 @@ index 0000000..2ace135
 +	return false;
 +}
 +
-+static void hydra_revert_all_threads(bool clear_state)
++static bool hydra_revert_all_threads(bool clear_state, int expected_pid)
 +{
 +	int i;
 +	struct task_struct *t;
@@ -190,13 +191,24 @@ index 0000000..2ace135
 +	stop_smart_worker();
 +
 +	mutex_lock(&hydra_mutex);
++
++	if (expected_pid > 0 && READ_ONCE(sched_hydra_pid) != expected_pid) {
++		mutex_unlock(&hydra_mutex);
++		return false;
++	}
 +	for (i = 0; i < hydra_thread_count; i++) {
 +		struct hydra_thread_state *state = &hydra_threads[i];
 +		
 +		rcu_read_lock();
 +		t = find_task_by_pid_ns(state->tid, &init_pid_ns);
-+		if (t)
-+			get_task_struct(t);
++		if (t) {
++			if (t->start_time != state->start_time) {
++				/* TID reused by a different task instance */
++				t = NULL;
++			} else {
++				get_task_struct(t);
++			}
++		}
 +		rcu_read_unlock();
 +
 +		if (t) {
@@ -208,30 +220,10 @@ index 0000000..2ace135
 +	if (clear_state)
 +		hydra_thread_count = 0;
 +	mutex_unlock(&hydra_mutex);
++	return true;
 +}
 +
-+static void hydra_revert_cpumask_only(void)
-+{
-+	int i;
-+	struct task_struct *t;
-+
-+	mutex_lock(&hydra_mutex);
-+	for (i = 0; i < hydra_thread_count; i++) {
-+		struct hydra_thread_state *state = &hydra_threads[i];
-+		
-+		rcu_read_lock();
-+		t = find_task_by_pid_ns(state->tid, &init_pid_ns);
-+		if (t)
-+			get_task_struct(t);
-+		rcu_read_unlock();
-+
-+		if (t) {
-+			set_cpus_allowed_ptr(t, &state->original_mask);
-+			put_task_struct(t);
-+		}
-+	}
-+	mutex_unlock(&hydra_mutex);
-+}
++/* hydra_revert_cpumask_only removed — use hydra_revert_all_threads(false) */
 +
 +static void hydra_optimize_threads(pid_t pid)
 +{
@@ -240,15 +232,13 @@ index 0000000..2ace135
 +	int target_count = 0;
 +	int i;
 +	cpumask_t allowed_mask;
++	bool has_big_cores;
 +
 +	if (pid <= 0)
 +		return;
 +
-+	hydra_detect_big_cores();
-+
 +	cpumask_and(&allowed_mask, &hydra_big_cores, cpu_online_mask);
-+	if (cpumask_empty(&allowed_mask))
-+		return;
++	has_big_cores = !cpumask_empty(&allowed_mask);
 +
 +	rcu_read_lock();
 +	p = find_task_by_pid_ns(pid, &init_pid_ns);
@@ -265,6 +255,9 @@ index 0000000..2ace135
 +			if (target_count < HYDRA_MAX_TRACKED_THREADS) {
 +				get_task_struct(t);
 +				targets[target_count++] = t;
++			} else {
++				pr_warn_ratelimited("hydra: thread cap reached (%d), dropping thread\n",
++						     HYDRA_MAX_TRACKED_THREADS);
 +			}
 +		}
 +	}
@@ -283,7 +276,7 @@ index 0000000..2ace135
 +		
 +		rcu_read_lock();
 +		t = find_task_by_pid_ns(state->tid, &init_pid_ns);
-+		if (!t || t->tgid != pid)
++		if (!t || t->tgid != pid || t->start_time != state->start_time)
 +			dead_or_reused = true;
 +		rcu_read_unlock();
 +
@@ -302,7 +295,8 @@ index 0000000..2ace135
 +		t = targets[i];
 +		
 +		for (j = 0; j < hydra_thread_count; j++) {
-+			if (hydra_threads[j].tid == t->pid) {
++			if (hydra_threads[j].tid == t->pid &&
++			    hydra_threads[j].start_time == t->start_time) {
 +				tracked = true;
 +				break;
 +			}
@@ -311,13 +305,16 @@ index 0000000..2ace135
 +		if (!tracked && hydra_thread_count < HYDRA_MAX_TRACKED_THREADS) {
 +			struct hydra_thread_state *state = &hydra_threads[hydra_thread_count++];
 +			state->tid = t->pid;
++			state->start_time = t->start_time;
 +			state->original_nice = task_nice(t);
 +			cpumask_copy(&state->original_mask, &t->cpus_allowed);
 +		}
 +
++		/* Nice-boost is always applied regardless of cpumask availability */
 +		set_user_nice(t, sched_hydra_nice);
 +		
-+		if (sched_hydra_smart_mode == 1)
++		/* Cpumask assignment only when big cores are online */
++		if (sched_hydra_smart_mode == 1 && has_big_cores)
 +			set_cpus_allowed_ptr(t, &allowed_mask);
 +
 +		put_task_struct(t);
@@ -364,7 +361,8 @@ index 0000000..2ace135
 +		rcu_read_lock();
 +		t = find_task_by_pid_ns(state->tid, &init_pid_ns);
 +		if (t) {
-+			if (t->tgid == sched_hydra_pid) {
++			if (t->tgid == sched_hydra_pid &&
++			    t->start_time == state->start_time) {
 +				get_task_struct(t);
 +				util = task_util(t);
 +			} else {
@@ -415,10 +413,13 @@ index 0000000..2ace135
 +
 +static void hydra_exit_work_fn(struct work_struct *work)
 +{
-+	if (atomic_xchg(&hydra_exit_pending, 0)) {
-+		hydra_revert_all_threads(true);
-+		WRITE_ONCE(sched_hydra_pid, 0);
-+		pr_info("hydra: auto-reverted on game exit\n");
++	int exit_pid = atomic_xchg(&hydra_exit_pid, 0);
++
++	if (exit_pid > 0) {
++		if (hydra_revert_all_threads(true, exit_pid)) {
++			if (cmpxchg(&sched_hydra_pid, exit_pid, 0) == exit_pid)
++				pr_info("hydra: auto-reverted on game exit (pid %d)\n", exit_pid);
++		}
 +	}
 +}
 +
@@ -433,7 +434,7 @@ index 0000000..2ace135
 +{
 +	int pid = READ_ONCE(sched_hydra_pid);
 +	if (pid > 0 && p->tgid == pid && p->pid == pid) {
-+		atomic_set(&hydra_exit_pending, 1);
++		atomic_set(&hydra_exit_pid, pid);
 +		schedule_work(&hydra_exit_work);
 +	}
 +}
@@ -453,7 +454,7 @@ index 0000000..2ace135
 +
 +	if (sched_hydra_pid != old_pid) {
 +		if (old_pid > 0)
-+			hydra_revert_all_threads(true);
++			hydra_revert_all_threads(true, 0);
 +
 +		if (sched_hydra_pid > 0 && static_branch_likely(&sched_hydra_enable_key))
 +			hydra_optimize_threads(sched_hydra_pid);
@@ -480,7 +481,7 @@ index 0000000..2ace135
 +		} else {
 +			static_branch_disable(&sched_hydra_enable_key);
 +			if (sched_hydra_pid > 0)
-+				hydra_revert_all_threads(true);
++				hydra_revert_all_threads(true, 0);
 +		}
 +	}
 +
@@ -517,6 +518,9 @@ index 0000000..2ace135
 +	int ret;
 +	int old_mode = sched_hydra_smart_mode;
 +
++	if (write && !capable(CAP_SYS_NICE))
++		return -EPERM;
++
 +	ret = proc_dointvec(table, write, buffer, lenp, ppos);
 +	if (ret || !write)
 +		return ret;
@@ -527,11 +531,13 @@ index 0000000..2ace135
 +		sched_hydra_smart_mode = 2;
 +
 +	if (sched_hydra_smart_mode != old_mode) {
++		if (old_mode == 2)
++			stop_smart_worker();
++
 +		if (sched_hydra_smart_mode == 0) {
-+			stop_smart_worker();
-+			hydra_revert_cpumask_only();
++			/* Full revert (nice + cpumask) but keep state for re-enable */
++			hydra_revert_all_threads(false, 0);
 +		} else if (sched_hydra_smart_mode == 1) {
-+			stop_smart_worker();
 +			if (sched_hydra_pid > 0 && static_branch_likely(&sched_hydra_enable_key))
 +				hydra_optimize_threads(sched_hydra_pid);
 +		} else if (sched_hydra_smart_mode == 2) {
@@ -548,6 +554,9 @@ index 0000000..2ace135
 +static int sched_hydra_simple_int_handler(struct ctl_table *table, int write,
 +					void __user *buffer, size_t *lenp, loff_t *ppos)
 +{
++	if (write && !capable(CAP_SYS_NICE))
++		return -EPERM;
++
 +	return proc_dointvec(table, write, buffer, lenp, ppos);
 +}
 +
@@ -608,6 +617,8 @@ index 0000000..2ace135
 +
 +static int __init sched_init_hydra(void)
 +{
++	hydra_detect_big_cores();
++
 +	INIT_WORK(&hydra_fork_work, hydra_fork_work_fn);
 +	INIT_WORK(&hydra_exit_work, hydra_exit_work_fn);
 +	INIT_DELAYED_WORK(&hydra_smart_dwork, hydra_smart_work_fn);
