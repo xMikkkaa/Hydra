@@ -1,21 +1,29 @@
-From b132434fc8e7b056709b3054ecc9ebfcd1bda559 Mon Sep 17 00:00:00 2001
+From 4eb7e9668d186d6199c5afd5e8d0635bbc524fa5 Mon Sep 17 00:00:00 2001
 From: xMikkkaa <xMikkkaa@users.noreply.github.com>
 Date: Wed, 5 Aug 2026 09:29:43 +0800
 Subject: [PATCH] sched: hydra: Introduce High-Yield Dynamic Render Affinity
- (v0.5)
+ (v0.6)
 
+v0.6:
+- Fix big-core topology detection race at late_initcall
+- Remove Smart Mode cold-start affinity gap
+- Move fork-triggered optimize to dedicated HIGHPRI workqueue
+- Log set_cpus_allowed_ptr() failures instead of ignoring them
+- Take pi_lock when snapshotting original cpumask
+- Synchronize hydra_big_cores reads in smart worker and stats handler against hydra_topo_mutex
+- Fix remaining unprotected hydra_big_cores read in hydra_optimize_threads()
 ---
  include/linux/sched/hydra.h |  63 +++
  init/Kconfig                |   7 +
  kernel/sched/Makefile       |   1 +
- kernel/sched/hydra.c        | 744 ++++++++++++++++++++++++++++++++++++
- 4 files changed, 815 insertions(+)
+ kernel/sched/hydra.c        | 792 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 863 insertions(+)
  create mode 100644 include/linux/sched/hydra.h
  create mode 100644 kernel/sched/hydra.c
 
 diff --git a/include/linux/sched/hydra.h b/include/linux/sched/hydra.h
 new file mode 100644
-index 0000000..afc39fd
+index 0000000..6a23d31
 --- /dev/null
 +++ b/include/linux/sched/hydra.h
 @@ -0,0 +1,63 @@
@@ -30,7 +38,7 @@ index 0000000..afc39fd
 +
 +#define SCHED_HYDRA_AUTHOR   "xMikkkaa"
 +#define SCHED_HYDRA_PROGNAME "HYDRA Game Thread Optimizer"
-+#define SCHED_HYDRA_VERSION  "0.5"
++#define SCHED_HYDRA_VERSION  "0.6"
 +
 +#define HYDRA_MAX_TRACKED_THREADS 64
 +
@@ -83,10 +91,10 @@ index 0000000..afc39fd
 +
 +#endif /* _LINUX_SCHED_HYDRA_H */
 diff --git a/init/Kconfig b/init/Kconfig
-index 62459b0..289bcd1 100644
+index 1ee3e4a..e3c0be8 100644
 --- a/init/Kconfig
 +++ b/init/Kconfig
-@@ -11,3 +11,10 @@ config SCHED_DEBUG
+@@ -2,3 +2,10 @@ config SCHED_DEBUG
  	  say Y to "Magic SysRq key" and "Magic SysRq key over serial".
  	  See <file:Documentation/admin-guide/sysrq.rst> for more details.
  	  Don't say Y unless you really know what this hack does.
@@ -107,10 +115,10 @@ index e8527cd..22385a4 100644
 +obj-$(CONFIG_SCHED_HYDRA) += hydra.o
 diff --git a/kernel/sched/hydra.c b/kernel/sched/hydra.c
 new file mode 100644
-index 0000000..0622492
+index 0000000..67a92b0
 --- /dev/null
 +++ b/kernel/sched/hydra.c
-@@ -0,0 +1,744 @@
+@@ -0,0 +1,792 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * High-Yield Dynamic Render Affinity (HYDRA) Thread Optimizer
@@ -165,6 +173,9 @@ index 0000000..0622492
 +
 +static cpumask_t hydra_big_cores;
 +static bool hydra_topology_detected;
++static DEFINE_MUTEX(hydra_topo_mutex);
++
++static struct workqueue_struct *hydra_wq;
 +
 +static struct work_struct hydra_fork_work;
 +static struct work_struct hydra_exit_work;
@@ -179,7 +190,7 @@ index 0000000..0622492
 +{
 +	if (!hydra_smart_running && sched_hydra_smart_mode == 2) {
 +		hydra_smart_running = true;
-+		schedule_delayed_work(&hydra_smart_dwork, msecs_to_jiffies(500));
++		schedule_delayed_work(&hydra_smart_dwork, 0);
 +	}
 +}
 +
@@ -205,8 +216,11 @@ index 0000000..0622492
 +	int cpu;
 +	unsigned long max_cap = 0;
 +
-+	if (hydra_topology_detected)
++	mutex_lock(&hydra_topo_mutex);
++	if (hydra_topology_detected) {
++		mutex_unlock(&hydra_topo_mutex);
 +		return;
++	}
 +
 +	cpumask_clear(&hydra_big_cores);
 +
@@ -222,9 +236,15 @@ index 0000000..0622492
 +			cpumask_set_cpu(cpu, &hydra_big_cores);
 +	}
 +
-+	hydra_topology_detected = true;
-+	pr_info("hydra: big core mask detected: %*pbl\n",
-+		cpumask_pr_args(&hydra_big_cores));
++	if (cpumask_weight(&hydra_big_cores) == num_possible_cpus()) {
++		pr_warn_ratelimited("hydra: big core detection unreliable, retrying later\n");
++		cpumask_clear(&hydra_big_cores);
++	} else {
++		hydra_topology_detected = true;
++		pr_info("hydra: big core mask detected: %*pbl\n",
++			cpumask_pr_args(&hydra_big_cores));
++	}
++	mutex_unlock(&hydra_topo_mutex);
 +}
 +
 +/* ======================== Thread matching ================================ */
@@ -274,8 +294,12 @@ index 0000000..0622492
 +		rcu_read_unlock();
 +
 +		if (t) {
++			int err;
 +			set_user_nice(t, state->original_nice);
-+			set_cpus_allowed_ptr(t, &state->original_mask);
++			err = set_cpus_allowed_ptr(t, &state->original_mask);
++			if (err)
++				pr_warn_ratelimited("hydra: affinity set failed for tid %d (err=%d)\n",
++						    t->pid, err);
 +			put_task_struct(t);
 +		}
 +	}
@@ -300,7 +324,11 @@ index 0000000..0622492
 +	if (pid <= 0)
 +		return;
 +
++	hydra_detect_big_cores();
++
++	mutex_lock(&hydra_topo_mutex);
 +	cpumask_and(&allowed_mask, &hydra_big_cores, cpu_online_mask);
++	mutex_unlock(&hydra_topo_mutex);
 +	has_big_cores = !cpumask_empty(&allowed_mask);
 +
 +	rcu_read_lock();
@@ -378,21 +406,29 @@ index 0000000..0622492
 +		}
 +
 +		if (!tracked && hydra_thread_count < HYDRA_MAX_TRACKED_THREADS) {
++			unsigned long flags;
 +			struct hydra_thread_state *state =
 +				&hydra_threads[hydra_thread_count++];
 +			state->tid = t->pid;
 +			state->start_time = t->start_time;
 +			state->original_nice = task_nice(t);
++
++			raw_spin_lock_irqsave(&t->pi_lock, flags);
 +			cpumask_copy(&state->original_mask,
 +				     &hydra_cpus_allowed(t));
++			raw_spin_unlock_irqrestore(&t->pi_lock, flags);
 +		}
 +
 +		/* Nice boost is always applied regardless of cpumask availability */
 +		set_user_nice(t, sched_hydra_nice);
 +
 +		/* Cpumask assignment only when big cores are online */
-+		if (sched_hydra_smart_mode == 1 && has_big_cores)
-+			set_cpus_allowed_ptr(t, &allowed_mask);
++		if (sched_hydra_smart_mode == 1 && has_big_cores) {
++			int err = set_cpus_allowed_ptr(t, &allowed_mask);
++			if (err)
++				pr_warn_ratelimited("hydra: affinity set failed for tid %d (err=%d)\n",
++						    t->pid, err);
++		}
 +
 +		put_task_struct(t);
 +	}
@@ -423,6 +459,7 @@ index 0000000..0622492
 +	if (sched_hydra_smart_mode != 2)
 +		goto end;
 +
++	mutex_lock(&hydra_topo_mutex);
 +	/* Get frequency of the first big core for thermal check */
 +	if (!cpumask_empty(&hydra_big_cores)) {
 +		int cpu = cpumask_first(&hydra_big_cores);
@@ -430,10 +467,11 @@ index 0000000..0622492
 +		big_core_freq = cpufreq_quick_get(cpu);
 +	}
 +
++	cpumask_and(&allowed_mask, &hydra_big_cores, cpu_online_mask);
++	mutex_unlock(&hydra_topo_mutex);
++
 +	if (big_core_freq > 0 && big_core_freq < sched_hydra_throttle_freq)
 +		is_throttled = true;
-+
-+	cpumask_and(&allowed_mask, &hydra_big_cores, cpu_online_mask);
 +
 +	mutex_lock(&hydra_mutex);
 +	for (i = 0; i < hydra_thread_count; i++) {
@@ -468,9 +506,10 @@ index 0000000..0622492
 +		}
 +
 +		if (t) {
++			int err = 0;
 +			if (is_throttled) {
 +				/* Thermal protection: release big core pinning */
-+				set_cpus_allowed_ptr(t, &state->original_mask);
++				err = set_cpus_allowed_ptr(t, &state->original_mask);
 +			} else {
 +				/*
 +				 * Hysteresis: only change cpumask at boundaries.
@@ -479,13 +518,16 @@ index 0000000..0622492
 +				 */
 +				if (util > sched_hydra_heavy_util) {
 +					if (!cpumask_empty(&allowed_mask))
-+						set_cpus_allowed_ptr(t,
++						err = set_cpus_allowed_ptr(t,
 +							&allowed_mask);
 +				} else if (util < sched_hydra_light_util) {
-+					set_cpus_allowed_ptr(t,
++					err = set_cpus_allowed_ptr(t,
 +						&state->original_mask);
 +				}
 +			}
++			if (err)
++				pr_warn_ratelimited("hydra: affinity set failed for tid %d (err=%d)\n",
++						    t->pid, err);
 +			put_task_struct(t);
 +		}
 +	}
@@ -526,6 +568,14 @@ index 0000000..0622492
 +
 +/* ======================== Tracepoint probes ============================== */
 +
++static void hydra_queue_work(struct work_struct *work)
++{
++	if (hydra_wq)
++		queue_work(hydra_wq, work);
++	else
++		schedule_work(work);
++}
++
 +static void probe_sched_process_fork(void *ignore,
 +				      struct task_struct *parent,
 +				      struct task_struct *child)
@@ -533,7 +583,7 @@ index 0000000..0622492
 +	int pid = READ_ONCE(sched_hydra_pid);
 +
 +	if (pid > 0 && parent->tgid == pid)
-+		schedule_work(&hydra_fork_work);
++		hydra_queue_work(&hydra_fork_work);
 +}
 +
 +static void probe_sched_process_exit(void *ignore, struct task_struct *p)
@@ -542,7 +592,7 @@ index 0000000..0622492
 +
 +	if (pid > 0 && p->tgid == pid && p->pid == pid) {
 +		atomic_set(&hydra_exit_pid, pid);
-+		schedule_work(&hydra_exit_work);
++		hydra_queue_work(&hydra_exit_work);
 +	}
 +}
 +
@@ -740,11 +790,13 @@ index 0000000..0622492
 +	if (write)
 +		return -EPERM;
 +
++	mutex_lock(&hydra_topo_mutex);
 +	if (!cpumask_empty(&hydra_big_cores)) {
 +		int cpu = cpumask_first(&hydra_big_cores);
 +
 +		big_core_freq = cpufreq_quick_get(cpu);
 +	}
++	mutex_unlock(&hydra_topo_mutex);
 +
 +	if (big_core_freq > 0 && big_core_freq < sched_hydra_throttle_freq)
 +		is_throttled = true;
@@ -841,6 +893,10 @@ index 0000000..0622492
 +static int __init sched_init_hydra(void)
 +{
 +	hydra_detect_big_cores();
++
++	hydra_wq = alloc_workqueue("hydra", WQ_HIGHPRI, 0);
++	if (!hydra_wq)
++		pr_err("hydra: failed to allocate high-priority workqueue, falling back to system_wq\n");
 +
 +	INIT_WORK(&hydra_fork_work, hydra_fork_work_fn);
 +	INIT_WORK(&hydra_exit_work, hydra_exit_work_fn);
