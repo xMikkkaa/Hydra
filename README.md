@@ -41,6 +41,9 @@ When a game PID is written to `hydra_pid`, HYDRA scans the process and its threa
    cd your-kernel-tree
    git apply path/to/patches/testing/0001-sched-hydra-Introduce-High-Yield-Dynamic-Render-Affinity.patch
    ```
+   > **Note**: If `git apply` fails due to context mismatch in `init/Kconfig` or `kernel/sched/Makefile` on custom kernels, you can safely skip patching those two files and add them manually:
+   > 1. In `kernel/sched/Makefile`, append this line anywhere: `obj-$(CONFIG_SCHED_HYDRA) += hydra.o`
+   > 2. In `init/Kconfig`, paste the `config SCHED_HYDRA` block (found inside the patch file) anywhere before the last `endmenu`.
 3. Add to your defconfig: `CONFIG_SCHED_HYDRA=y`
 4. Build the kernel normally.
 5. Flash the kernel.
