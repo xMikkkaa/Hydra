@@ -1,21 +1,21 @@
-From f8600ecc0eadb1d064364f9a3360ec77cdef47d6 Mon Sep 17 00:00:00 2001
+From b132434fc8e7b056709b3054ecc9ebfcd1bda559 Mon Sep 17 00:00:00 2001
 From: xMikkkaa <xMikkkaa@users.noreply.github.com>
-Date: Wed, 5 Aug 2026 08:32:13 +0800
-Subject: [PATCH] sched: hydra: Add compatibility macros, hydra_stats sysctl,
- and validation handlers
+Date: Wed, 5 Aug 2026 09:29:43 +0800
+Subject: [PATCH] sched: hydra: Introduce High-Yield Dynamic Render Affinity
+ (v0.5)
 
 ---
- include/linux/sched/hydra.h |  63 ++++
- init/Kconfig                |   4 +
+ include/linux/sched/hydra.h |  63 +++
+ init/Kconfig                |   7 +
  kernel/sched/Makefile       |   1 +
- kernel/sched/hydra.c        | 735 ++++++++++++++++++++++++++++++++++++
- 4 files changed, 803 insertions(+)
+ kernel/sched/hydra.c        | 744 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 815 insertions(+)
  create mode 100644 include/linux/sched/hydra.h
  create mode 100644 kernel/sched/hydra.c
 
 diff --git a/include/linux/sched/hydra.h b/include/linux/sched/hydra.h
 new file mode 100644
-index 0000000..8f1ba60
+index 0000000..afc39fd
 --- /dev/null
 +++ b/include/linux/sched/hydra.h
 @@ -0,0 +1,63 @@
@@ -30,7 +30,7 @@ index 0000000..8f1ba60
 +
 +#define SCHED_HYDRA_AUTHOR   "xMikkkaa"
 +#define SCHED_HYDRA_PROGNAME "HYDRA Game Thread Optimizer"
-+#define SCHED_HYDRA_VERSION  "0.4"
++#define SCHED_HYDRA_VERSION  "0.5"
 +
 +#define HYDRA_MAX_TRACKED_THREADS 64
 +
@@ -83,30 +83,34 @@ index 0000000..8f1ba60
 +
 +#endif /* _LINUX_SCHED_HYDRA_H */
 diff --git a/init/Kconfig b/init/Kconfig
-index 25c163c..1c74a8c 100644
+index 62459b0..289bcd1 100644
 --- a/init/Kconfig
 +++ b/init/Kconfig
-@@ -1,3 +1,7 @@
- # Kconfig
+@@ -11,3 +11,10 @@ config SCHED_DEBUG
+ 	  say Y to "Magic SysRq key" and "Magic SysRq key over serial".
+ 	  See <file:Documentation/admin-guide/sysrq.rst> for more details.
+ 	  Don't say Y unless you really know what this hack does.
 +config SCHED_HYDRA
-+	bool "HYDRA"
-+	default y
-+
- config SCHED_TUNE
- 	bool "Boost"
++	bool "High-Yield Dynamic Render Affinity (HYDRA)"
++	default n
++	help
++	  HYDRA optimizes game rendering threads by applying nice boosts and
++	  big-core affinity. It is activated on-demand via sysctl and operates
++	  entirely isolated from the core scheduler.
 diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
-index 23971e4..eeeed68 100644
+index e8527cd..22385a4 100644
 --- a/kernel/sched/Makefile
 +++ b/kernel/sched/Makefile
-@@ -1 +1,2 @@
- # Makefile
+@@ -1,2 +1,3 @@
+ obj-y += core.o loadavg.o clock.o cputime.o
+ obj-y += idle.o fair.o rt.o deadline.o
 +obj-$(CONFIG_SCHED_HYDRA) += hydra.o
 diff --git a/kernel/sched/hydra.c b/kernel/sched/hydra.c
 new file mode 100644
-index 0000000..6556fb2
+index 0000000..0622492
 --- /dev/null
 +++ b/kernel/sched/hydra.c
-@@ -0,0 +1,735 @@
+@@ -0,0 +1,744 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * High-Yield Dynamic Render Affinity (HYDRA) Thread Optimizer
@@ -156,6 +160,8 @@ index 0000000..6556fb2
 +static struct hydra_thread_state hydra_threads[HYDRA_MAX_TRACKED_THREADS];
 +static int hydra_thread_count;
 +static DEFINE_MUTEX(hydra_mutex);
++static struct task_struct *hydra_target_buffer[HYDRA_MAX_TRACKED_THREADS];
++
 +
 +static cpumask_t hydra_big_cores;
 +static bool hydra_topology_detected;
@@ -187,6 +193,13 @@ index 0000000..6556fb2
 +
 +/* ======================== Topology detection ============================= */
 +
++/*
++ * NOTE: Topology detection runs once at boot. It assumes the big core mask
++ * (hydra_big_cores) is static. If CPU hotplug removes big cores, this mask
++ * may contain offline CPUs. The cpumask_and(&allowed_mask, &hydra_big_cores,
++ * cpu_online_mask) operation at usage sites mitigates this, but a full
++ * cpuhp_state callback would be needed for perfect hotplug awareness.
++ */
 +static void hydra_detect_big_cores(void)
 +{
 +	int cpu;
@@ -218,13 +231,10 @@ index 0000000..6556fb2
 +
 +static bool hydra_match_thread(struct task_struct *t)
 +{
-+	char comm[TASK_COMM_LEN];
 +	int i;
 +
-+	get_task_comm(comm, t);
-+
 +	for (i = 0; i < HYDRA_NUM_COMM_PATTERNS; i++) {
-+		if (strnstr(comm, hydra_comm_patterns[i], TASK_COMM_LEN))
++		if (strnstr(t->comm, hydra_comm_patterns[i], TASK_COMM_LEN))
 +			return true;
 +	}
 +
@@ -282,7 +292,6 @@ index 0000000..6556fb2
 +static void hydra_optimize_threads(pid_t pid)
 +{
 +	struct task_struct *p, *t;
-+	struct task_struct *targets[HYDRA_MAX_TRACKED_THREADS];
 +	int target_count = 0;
 +	int i;
 +	cpumask_t allowed_mask;
@@ -308,12 +317,13 @@ index 0000000..6556fb2
 +	 * it performs an atomic_inc() on t->usage which is non-blocking.
 +	 * The read_lock is required for safe for_each_thread() iteration.
 +	 */
++	mutex_lock(&hydra_mutex);
 +	read_lock(&tasklist_lock);
 +	for_each_thread(p, t) {
 +		if (hydra_match_thread(t)) {
 +			if (target_count < HYDRA_MAX_TRACKED_THREADS) {
 +				get_task_struct(t);
-+				targets[target_count++] = t;
++				hydra_target_buffer[target_count++] = t;
 +			} else {
 +				pr_warn_ratelimited("hydra: thread cap reached (%d), dropping thread\n",
 +						    HYDRA_MAX_TRACKED_THREADS);
@@ -325,12 +335,12 @@ index 0000000..6556fb2
 +
 +	/*
 +	 * Early return if no threads matched — safe because p was already
-+	 * released above and targets[] is empty, so no reference leak.
++	 * released above and hydra_target_buffer[] is empty.
 +	 */
-+	if (target_count == 0)
++	if (target_count == 0) {
++		mutex_unlock(&hydra_mutex);
 +		return;
-+
-+	mutex_lock(&hydra_mutex);
++	}
 +
 +	/* Prune dead or TID-reused threads to free up slots (O(1) swap-and-pop) */
 +	for (i = 0; i < hydra_thread_count; i++) {
@@ -356,7 +366,7 @@ index 0000000..6556fb2
 +		bool tracked = false;
 +		int j;
 +
-+		t = targets[i];
++		t = hydra_target_buffer[i];
 +
 +		/* Check if thread is already tracked */
 +		for (j = 0; j < hydra_thread_count; j++) {
@@ -404,8 +414,9 @@ index 0000000..6556fb2
 +	unsigned int big_core_freq = 0;
 +	bool is_throttled = false;
 +	cpumask_t allowed_mask;
++	int pid = READ_ONCE(sched_hydra_pid);
 +
-+	if (sched_hydra_pid <= 0 ||
++	if (pid <= 0 ||
 +	    !static_branch_likely(&sched_hydra_enable_key))
 +		goto end;
 +
@@ -433,7 +444,7 @@ index 0000000..6556fb2
 +		rcu_read_lock();
 +		t = find_task_by_pid_ns(state->tid, &init_pid_ns);
 +		if (t) {
-+			if (t->tgid == sched_hydra_pid &&
++			if (t->tgid == pid &&
 +			    t->start_time == state->start_time) {
 +				get_task_struct(t);
 +				util = task_util(t);
@@ -692,6 +703,7 @@ index 0000000..6556fb2
 +	if (ret || !write)
 +		return ret;
 +
++	mutex_lock(&hydra_mutex);
 +	/* Clamp to valid range */
 +	if (sched_hydra_heavy_util < 0)
 +		sched_hydra_heavy_util = 0;
@@ -706,6 +718,7 @@ index 0000000..6556fb2
 +	/* Enforce light <= heavy invariant */
 +	if (sched_hydra_light_util > sched_hydra_heavy_util)
 +		sched_hydra_light_util = sched_hydra_heavy_util;
++	mutex_unlock(&hydra_mutex);
 +
 +	return 0;
 +}
@@ -748,7 +761,7 @@ index 0000000..6556fb2
 +			 sched_hydra_enable,
 +			 sched_hydra_pid,
 +			 sched_hydra_smart_mode,
-+			 hydra_thread_count,
++			 READ_ONCE(hydra_thread_count),
 +			 is_throttled ? 1 : 0,
 +			 big_core_freq);
 +
