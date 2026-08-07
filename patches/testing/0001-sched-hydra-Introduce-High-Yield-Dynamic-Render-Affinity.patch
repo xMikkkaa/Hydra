@@ -1,8 +1,11 @@
-From 4eb7e9668d186d6199c5afd5e8d0635bbc524fa5 Mon Sep 17 00:00:00 2001
+From 22d2e690f1bb723725fb9adb63a4f7db90850df6 Mon Sep 17 00:00:00 2001
 From: xMikkkaa <xMikkkaa@users.noreply.github.com>
 Date: Wed, 5 Aug 2026 09:29:43 +0800
 Subject: [PATCH] sched: hydra: Introduce High-Yield Dynamic Render Affinity
- (v0.6)
+ (v0.7)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 v0.6:
 - Fix big-core topology detection race at late_initcall
@@ -12,21 +15,30 @@ v0.6:
 - Take pi_lock when snapshotting original cpumask
 - Synchronize hydra_big_cores reads in smart worker and stats handler against hydra_topo_mutex
 - Fix remaining unprotected hydra_big_cores read in hydra_optimize_threads()
+
+v0.7:
+- Generalize big/little detection into N-cluster detection (hydra_clusters[])
+- Add hydra_cluster_depth sysctl (default: auto — pins every tier except
+  little, scales correctly to 3/4-cluster SoCs instead of shrinking to a
+  single topmost core)
+- Extend hydra_stats with per-cluster detail
+- Add CONFIG_SCHED_HYDRA_DEBUG-gated hydra_debug_fake_clusters for testing
+  without physical 3/4-cluster hardware
 ---
- include/linux/sched/hydra.h |  63 +++
- init/Kconfig                |   7 +
+ include/linux/sched/hydra.h |  65 +++
+ init/Kconfig                |  15 +
  kernel/sched/Makefile       |   1 +
- kernel/sched/hydra.c        | 792 ++++++++++++++++++++++++++++++++++++
- 4 files changed, 863 insertions(+)
+ kernel/sched/hydra.c        | 953 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 1034 insertions(+)
  create mode 100644 include/linux/sched/hydra.h
  create mode 100644 kernel/sched/hydra.c
 
 diff --git a/include/linux/sched/hydra.h b/include/linux/sched/hydra.h
 new file mode 100644
-index 0000000..6a23d31
+index 0000000..636349c
 --- /dev/null
 +++ b/include/linux/sched/hydra.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,65 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_SCHED_HYDRA_H
 +#define _LINUX_SCHED_HYDRA_H
@@ -38,7 +50,9 @@ index 0000000..6a23d31
 +
 +#define SCHED_HYDRA_AUTHOR   "xMikkkaa"
 +#define SCHED_HYDRA_PROGNAME "HYDRA Game Thread Optimizer"
-+#define SCHED_HYDRA_VERSION  "0.6"
++#define SCHED_HYDRA_VERSION  "0.7"
++
++#define HYDRA_MAX_CLUSTERS 4
 +
 +#define HYDRA_MAX_TRACKED_THREADS 64
 +
@@ -91,10 +105,10 @@ index 0000000..6a23d31
 +
 +#endif /* _LINUX_SCHED_HYDRA_H */
 diff --git a/init/Kconfig b/init/Kconfig
-index 1ee3e4a..e3c0be8 100644
+index 1ee3e4a..f81ceac 100644
 --- a/init/Kconfig
 +++ b/init/Kconfig
-@@ -2,3 +2,10 @@ config SCHED_DEBUG
+@@ -2,3 +2,18 @@ config SCHED_DEBUG
  	  say Y to "Magic SysRq key" and "Magic SysRq key over serial".
  	  See <file:Documentation/admin-guide/sysrq.rst> for more details.
  	  Don't say Y unless you really know what this hack does.
@@ -105,6 +119,14 @@ index 1ee3e4a..e3c0be8 100644
 +	  HYDRA optimizes game rendering threads by applying nice boosts and
 +	  big-core affinity. It is activated on-demand via sysctl and operates
 +	  entirely isolated from the core scheduler.
++
++config SCHED_HYDRA_DEBUG
++	bool "HYDRA Debug Mode"
++	depends on SCHED_HYDRA
++	default n
++	help
++	  Enable debug features for HYDRA, such as the fake cluster topology
++	  sysctl. Only enable this for development/testing.
 diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
 index e8527cd..22385a4 100644
 --- a/kernel/sched/Makefile
@@ -115,10 +137,10 @@ index e8527cd..22385a4 100644
 +obj-$(CONFIG_SCHED_HYDRA) += hydra.o
 diff --git a/kernel/sched/hydra.c b/kernel/sched/hydra.c
 new file mode 100644
-index 0000000..67a92b0
+index 0000000..2d91157
 --- /dev/null
 +++ b/kernel/sched/hydra.c
-@@ -0,0 +1,792 @@
+@@ -0,0 +1,953 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * High-Yield Dynamic Render Affinity (HYDRA) Thread Optimizer
@@ -162,6 +184,11 @@ index 0000000..67a92b0
 +int sched_hydra_throttle_freq = 1400000;
 +int sched_hydra_heavy_util = 300;
 +int sched_hydra_light_util = 100;
++int sched_hydra_cluster_depth = 0;
++
++#ifdef CONFIG_SCHED_HYDRA_DEBUG
++char hydra_debug_fake_clusters[128] = "";
++#endif
 +
 +/* ======================== Internal state ================================= */
 +
@@ -170,9 +197,9 @@ index 0000000..67a92b0
 +static DEFINE_MUTEX(hydra_mutex);
 +static struct task_struct *hydra_target_buffer[HYDRA_MAX_TRACKED_THREADS];
 +
-+
-+static cpumask_t hydra_big_cores;
-+static bool hydra_topology_detected;
++static cpumask_t hydra_clusters[HYDRA_MAX_CLUSTERS];
++static unsigned long hydra_cluster_capacity[HYDRA_MAX_CLUSTERS];
++static int hydra_cluster_count;
 +static DEFINE_MUTEX(hydra_topo_mutex);
 +
 +static struct workqueue_struct *hydra_wq;
@@ -205,44 +232,108 @@ index 0000000..67a92b0
 +/* ======================== Topology detection ============================= */
 +
 +/*
-+ * NOTE: Topology detection runs once at boot. It assumes the big core mask
-+ * (hydra_big_cores) is static. If CPU hotplug removes big cores, this mask
-+ * may contain offline CPUs. The cpumask_and(&allowed_mask, &hydra_big_cores,
-+ * cpu_online_mask) operation at usage sites mitigates this, but a full
-+ * cpuhp_state callback would be needed for perfect hotplug awareness.
++ * NOTE: Topology detection assumes the cluster masks (hydra_clusters) are
++ * static. If CPU hotplug removes cores, this mask may contain offline CPUs.
++ * The cpumask_and(&allowed_mask, ..., cpu_online_mask) operation at usage
++ * sites mitigates this, but a full cpuhp_state callback would be needed for
++ * perfect hotplug awareness.
 + */
-+static void hydra_detect_big_cores(void)
++static unsigned long hydra_get_cpu_capacity(int cpu)
 +{
-+	int cpu;
-+	unsigned long max_cap = 0;
++#ifdef CONFIG_SCHED_HYDRA_DEBUG
++	if (hydra_debug_fake_clusters[0] != '\0') {
++		char *p = hydra_debug_fake_clusters;
++		unsigned long caps[HYDRA_MAX_CLUSTERS + 4] = {0};
++		int count = 0, i;
++
++		for (i = 0; i < ARRAY_SIZE(caps) && p && *p; i++) {
++			caps[i] = simple_strtoul(p, &p, 10);
++			if (*p == ',')
++				p++;
++			count++;
++		}
++		
++		if (count > 0)
++			return caps[cpu % count] ? caps[cpu % count] : 1024;
++	}
++#endif
++	return capacity_orig_of(cpu);
++}
++
++static void hydra_detect_clusters(void)
++{
++	int cpu, i, j;
++	int temp_count = 0;
++	cpumask_t temp_masks[16];
++	unsigned long temp_caps[16];
 +
 +	mutex_lock(&hydra_topo_mutex);
-+	if (hydra_topology_detected) {
++	if (hydra_cluster_count > 0) {
 +		mutex_unlock(&hydra_topo_mutex);
 +		return;
 +	}
 +
-+	cpumask_clear(&hydra_big_cores);
-+
-+	for_each_possible_cpu(cpu) {
-+		unsigned long cap = capacity_orig_of(cpu);
-+
-+		if (cap > max_cap)
-+			max_cap = cap;
++	for (i = 0; i < 16; i++) {
++		cpumask_clear(&temp_masks[i]);
++		temp_caps[i] = 0;
 +	}
 +
 +	for_each_possible_cpu(cpu) {
-+		if (capacity_orig_of(cpu) == max_cap)
-+			cpumask_set_cpu(cpu, &hydra_big_cores);
++		unsigned long cap = hydra_get_cpu_capacity(cpu);
++		bool found = false;
++
++		for (i = 0; i < temp_count; i++) {
++			unsigned long max_c = max(cap, temp_caps[i]);
++			unsigned long min_c = min(cap, temp_caps[i]);
++			if (max_c - min_c <= (max_c * 6) / 100) {
++				cpumask_set_cpu(cpu, &temp_masks[i]);
++				temp_caps[i] = max_c;
++				found = true;
++				break;
++			}
++		}
++		if (!found && temp_count < 16) {
++			cpumask_set_cpu(cpu, &temp_masks[temp_count]);
++			temp_caps[temp_count] = cap;
++			temp_count++;
++		}
 +	}
 +
-+	if (cpumask_weight(&hydra_big_cores) == num_possible_cpus()) {
-+		pr_warn_ratelimited("hydra: big core detection unreliable, retrying later\n");
-+		cpumask_clear(&hydra_big_cores);
++	for (i = 0; i < temp_count - 1; i++) {
++		for (j = i + 1; j < temp_count; j++) {
++			if (temp_caps[i] > temp_caps[j]) {
++				unsigned long tmp_cap = temp_caps[i];
++				cpumask_t tmp_mask;
++				
++				temp_caps[i] = temp_caps[j];
++				temp_caps[j] = tmp_cap;
++				
++				cpumask_copy(&tmp_mask, &temp_masks[i]);
++				cpumask_copy(&temp_masks[i], &temp_masks[j]);
++				cpumask_copy(&temp_masks[j], &tmp_mask);
++			}
++		}
++	}
++
++	while (temp_count > HYDRA_MAX_CLUSTERS) {
++		cpumask_or(&temp_masks[1], &temp_masks[0], &temp_masks[1]);
++		for (i = 0; i < temp_count - 1; i++) {
++			cpumask_copy(&temp_masks[i], &temp_masks[i + 1]);
++			temp_caps[i] = temp_caps[i + 1];
++		}
++		temp_count--;
++	}
++
++	if (temp_count == 1 && cpumask_weight(&temp_masks[0]) == num_possible_cpus()) {
++		pr_warn_ratelimited("hydra: cluster detection unreliable, retrying later\n");
 +	} else {
-+		hydra_topology_detected = true;
-+		pr_info("hydra: big core mask detected: %*pbl\n",
-+			cpumask_pr_args(&hydra_big_cores));
++		for (i = 0; i < temp_count; i++) {
++			cpumask_copy(&hydra_clusters[i], &temp_masks[i]);
++			hydra_cluster_capacity[i] = temp_caps[i];
++			pr_info("hydra: tier %d (cap ~%lu) mask: %*pbl\n",
++				i, temp_caps[i], cpumask_pr_args(&hydra_clusters[i]));
++		}
++		hydra_cluster_count = temp_count;
 +	}
 +	mutex_unlock(&hydra_topo_mutex);
 +}
@@ -317,17 +408,24 @@ index 0000000..67a92b0
 +{
 +	struct task_struct *p, *t;
 +	int target_count = 0;
-+	int i;
++	int i, start, effective_depth;
 +	cpumask_t allowed_mask;
 +	bool has_big_cores;
 +
 +	if (pid <= 0)
 +		return;
 +
-+	hydra_detect_big_cores();
++	hydra_detect_clusters();
 +
 +	mutex_lock(&hydra_topo_mutex);
-+	cpumask_and(&allowed_mask, &hydra_big_cores, cpu_online_mask);
++	cpumask_clear(&allowed_mask);
++	effective_depth = (sched_hydra_cluster_depth == 0)
++		? max(1, hydra_cluster_count - 1)
++		: sched_hydra_cluster_depth;
++	start = max(0, hydra_cluster_count - effective_depth);
++	for (i = start; i < hydra_cluster_count; i++)
++		cpumask_or(&allowed_mask, &allowed_mask, &hydra_clusters[i]);
++	cpumask_and(&allowed_mask, &allowed_mask, cpu_online_mask);
 +	mutex_unlock(&hydra_topo_mutex);
 +	has_big_cores = !cpumask_empty(&allowed_mask);
 +
@@ -445,7 +543,7 @@ index 0000000..67a92b0
 +
 +static void hydra_smart_work_fn(struct work_struct *work)
 +{
-+	int i;
++	int i, start, effective_depth;
 +	struct task_struct *t;
 +	unsigned int big_core_freq = 0;
 +	bool is_throttled = false;
@@ -460,14 +558,21 @@ index 0000000..67a92b0
 +		goto end;
 +
 +	mutex_lock(&hydra_topo_mutex);
-+	/* Get frequency of the first big core for thermal check */
-+	if (!cpumask_empty(&hydra_big_cores)) {
-+		int cpu = cpumask_first(&hydra_big_cores);
++	/* Get frequency of the highest big core tier for thermal check */
++	if (hydra_cluster_count > 0) {
++		int cpu = cpumask_first(&hydra_clusters[hydra_cluster_count - 1]);
 +
 +		big_core_freq = cpufreq_quick_get(cpu);
 +	}
 +
-+	cpumask_and(&allowed_mask, &hydra_big_cores, cpu_online_mask);
++	cpumask_clear(&allowed_mask);
++	effective_depth = (sched_hydra_cluster_depth == 0)
++		? max(1, hydra_cluster_count - 1)
++		: sched_hydra_cluster_depth;
++	start = max(0, hydra_cluster_count - effective_depth);
++	for (i = start; i < hydra_cluster_count; i++)
++		cpumask_or(&allowed_mask, &allowed_mask, &hydra_clusters[i]);
++	cpumask_and(&allowed_mask, &allowed_mask, cpu_online_mask);
 +	mutex_unlock(&hydra_topo_mutex);
 +
 +	if (big_core_freq > 0 && big_core_freq < sched_hydra_throttle_freq)
@@ -781,18 +886,19 @@ index 0000000..67a92b0
 +				     void __user *buffer, size_t *lenp,
 +				     loff_t *ppos)
 +{
-+	char stats_buf[256];
++	char stats_buf[1024];
 +	struct ctl_table tmp_table;
 +	unsigned int big_core_freq = 0;
 +	bool is_throttled = false;
-+	int count;
++	int count = 0;
++	int i;
 +
 +	if (write)
 +		return -EPERM;
 +
 +	mutex_lock(&hydra_topo_mutex);
-+	if (!cpumask_empty(&hydra_big_cores)) {
-+		int cpu = cpumask_first(&hydra_big_cores);
++	if (hydra_cluster_count > 0) {
++		int cpu = cpumask_first(&hydra_clusters[hydra_cluster_count - 1]);
 +
 +		big_core_freq = cpufreq_quick_get(cpu);
 +	}
@@ -801,11 +907,12 @@ index 0000000..67a92b0
 +	if (big_core_freq > 0 && big_core_freq < sched_hydra_throttle_freq)
 +		is_throttled = true;
 +
-+	count = snprintf(stats_buf, sizeof(stats_buf),
++	count += snprintf(stats_buf + count, sizeof(stats_buf) - count,
 +			 "version=%s\n"
 +			 "enabled=%d\n"
 +			 "pid=%d\n"
 +			 "mode=%d\n"
++			 "depth=%d\n"
 +			 "tracked_threads=%d\n"
 +			 "throttled=%d\n"
 +			 "big_core_freq=%u\n",
@@ -813,9 +920,22 @@ index 0000000..67a92b0
 +			 sched_hydra_enable,
 +			 sched_hydra_pid,
 +			 sched_hydra_smart_mode,
++			 sched_hydra_cluster_depth,
 +			 READ_ONCE(hydra_thread_count),
 +			 is_throttled ? 1 : 0,
 +			 big_core_freq);
++
++	mutex_lock(&hydra_topo_mutex);
++	count += snprintf(stats_buf + count, sizeof(stats_buf) - count,
++			  "clusters: %d\n", hydra_cluster_count);
++	for (i = 0; i < hydra_cluster_count; i++) {
++		count += snprintf(stats_buf + count, sizeof(stats_buf) - count,
++				  "tier %d: cap=%lu cpus=%d mask=%*pbl\n",
++				  i, hydra_cluster_capacity[i],
++				  cpumask_weight(&hydra_clusters[i]),
++				  cpumask_pr_args(&hydra_clusters[i]));
++	}
++	mutex_unlock(&hydra_topo_mutex);
 +
 +	tmp_table = *table;
 +	tmp_table.data = stats_buf;
@@ -823,6 +943,53 @@ index 0000000..67a92b0
 +
 +	return proc_dostring(&tmp_table, write, buffer, lenp, ppos);
 +}
++
++static int sched_hydra_depth_handler(struct ctl_table *table, int write,
++				     void __user *buffer, size_t *lenp,
++				     loff_t *ppos)
++{
++	int ret;
++	int old = sched_hydra_cluster_depth;
++	int max_depth;
++
++	if (write && !capable(CAP_SYS_NICE))
++		return -EPERM;
++
++	ret = proc_dointvec(table, write, buffer, lenp, ppos);
++	if (ret || !write)
++		return ret;
++
++	mutex_lock(&hydra_topo_mutex);
++	max_depth = max(1, hydra_cluster_count - 1);
++	mutex_unlock(&hydra_topo_mutex);
++
++	if (sched_hydra_cluster_depth < 0)
++		sched_hydra_cluster_depth = 0;
++	else if (sched_hydra_cluster_depth > max_depth)
++		sched_hydra_cluster_depth = max_depth;
++
++	if (sched_hydra_cluster_depth != old && sched_hydra_pid > 0 &&
++	    static_branch_likely(&sched_hydra_enable_key)) {
++		if (sched_hydra_smart_mode == 2)
++			start_smart_worker();
++		else if (sched_hydra_smart_mode == 1)
++			hydra_optimize_threads(sched_hydra_pid);
++	}
++
++	return 0;
++}
++
++#ifdef CONFIG_SCHED_HYDRA_DEBUG
++static int sched_hydra_debug_handler(struct ctl_table *table, int write,
++				     void __user *buffer, size_t *lenp,
++				     loff_t *ppos)
++{
++	if (write && !capable(CAP_SYS_NICE))
++		return -EPERM;
++
++	return proc_dostring(table, write, buffer, lenp, ppos);
++}
++#endif
 +
 +/* ======================== Sysctl table =================================== */
 +
@@ -883,6 +1050,22 @@ index 0000000..67a92b0
 +		.mode		= 0444,
 +		.proc_handler	= sched_hydra_stats_handler,
 +	},
++	{
++		.procname	= "hydra_cluster_depth",
++		.data		= &sched_hydra_cluster_depth,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= sched_hydra_depth_handler,
++	},
++#ifdef CONFIG_SCHED_HYDRA_DEBUG
++	{
++		.procname	= "hydra_debug_fake_clusters",
++		.data		= hydra_debug_fake_clusters,
++		.maxlen		= sizeof(hydra_debug_fake_clusters),
++		.mode		= 0644,
++		.proc_handler	= sched_hydra_debug_handler,
++	},
++#endif
 +	{ }
 +};
 +
@@ -892,7 +1075,7 @@ index 0000000..67a92b0
 +
 +static int __init sched_init_hydra(void)
 +{
-+	hydra_detect_big_cores();
++	hydra_detect_clusters();
 +
 +	hydra_wq = alloc_workqueue("hydra", WQ_HIGHPRI, 0);
 +	if (!hydra_wq)
