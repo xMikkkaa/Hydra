@@ -3,9 +3,10 @@
 Kernel-level game thread optimizer for Android — automatic nice boost + big core affinity for rendering threads.
 
 ## Overview
-- **What it does**: Applies a nice boost (default -10) to render threads matching specific comm patterns and pins them to big cores.
+- **What it does**: Applies a nice boost (default -10), pins specific render threads to Big/Prime cores, and enforces `uclamp_min` frequency boosting.
+- **Hybrid Matching**: Supports both static fallback patterns (`RenderThread`, etc.) and real-time dynamic patterns injected via `/proc/sys/kernel/hydra_thread_patterns`.
 - **On-demand**: Activated by writing a game PID to `/proc/sys/kernel/hydra_pid`. Zero overhead when idle.
-- **Smart Mode**: Adaptive thermal-aware cpumask management.
+- **Smart Mode & Topology**: Adaptive thermal-aware cpumask management that instantly responds to CPU hotplug events.
 - **Isolated**: Lives entirely in `hydra.c` and `hydra.h`, never modifying core scheduler files (`fair.c`, `core.c`, etc.).
 
 ## How It Works
@@ -13,15 +14,19 @@ Kernel-level game thread optimizer for Android — automatic nice boost + big co
 ```mermaid
 flowchart LR
     A["Game process"] --> B["Aozora Kernel Manager"]
-    B -->|"write PID"| C["/proc/sys/kernel/hydra_pid"]
+    B -->|"Write PID & Dynamic Patterns"| C["/proc/sys/kernel/hydra_* sysctls"]
     C --> D["hydra.c sysctl handler"]
     D --> E["hydra_optimize_threads()"]
-    E --> F["Match comm patterns"]
+    E --> F{"Match Static &
+Dynamic Patterns"}
     F --> G["set_user_nice()"]
-    F --> H["set_cpus_allowed_ptr() → big cores"]
+    F --> H["set_cpus_allowed_ptr()
+→ Big/Prime Cores"]
+    F --> U["uclamp_min Boost"]
     I["sched_process_fork tracepoint"] --> E
     J["sched_process_exit tracepoint"] --> K["hydra_revert_all_threads()"]
-    L["Smart worker (500ms, mode 2)"] --> M["Read task_util + cpufreq"]
+    L["CPU Hotplug (cpuhp)"] --> E
+    S["Smart worker (500ms, mode 2)"] --> M["Thermal Sweep (for_each_cpu_and)"]
     M --> H
 ```
 
@@ -39,7 +44,7 @@ When a game PID is written to `hydra_pid`, HYDRA scans the process and its threa
 2. Apply the patch to your kernel tree:
    ```bash
    cd your-kernel-tree
-   git apply path/to/patches/testing/0001-android-msm-hydra-0.8.patch
+   git apply path/to/patches/testing/0001-android-msm-hydra-0.9.patch
    ```
    > **Note**: If `git apply` fails due to context mismatch in `init/Kconfig` or `kernel/sched/Makefile` on custom kernels, you can safely skip patching those two files and add them manually:
    > 1. In `kernel/sched/Makefile`, append this line anywhere: `obj-$(CONFIG_SCHED_HYDRA) += hydra.o`
@@ -89,7 +94,7 @@ All tunables are located under `/proc/sys/kernel/`:
 | `hydra_light_util` | `100` | `0-1024` | Utilization below this restores the original cpumask. |
 | `hydra_stats` | *(read-only)* | - | Shows: tracked threads, mode, throttle state, active PID, version. |
 | `hydra_cluster_depth` | `0` | `0` to `max_clusters-1` | Number of top clusters to pin (0 = auto, pins all except little). |
-| `hydra_thread_patterns`| `RenderThread,...` | String | Comma-separated list of thread names to match dynamically. |
+| `hydra_thread_patterns`| `""` (empty) | String | Comma-separated list of thread names to match dynamically. |
 | `hydra_uclamp_min` | `0` | `0-1024` | uclamp_min value to boost matched threads (0 = disable). |
 
 **IMPORTANT**: `hydra_light_util` must be ≤ `hydra_heavy_util`. The gap between these two values acts as a hysteresis zone where the thread maintains its current state, intentionally preventing cpumask thrashing.
