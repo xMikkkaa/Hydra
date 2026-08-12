@@ -1,44 +1,28 @@
-From 22d2e690f1bb723725fb9adb63a4f7db90850df6 Mon Sep 17 00:00:00 2001
+From 95864dfb168045e8beb0f14c8471683f388e9ea6 Mon Sep 17 00:00:00 2001
 From: xMikkkaa <xMikkkaa@users.noreply.github.com>
-Date: Wed, 5 Aug 2026 09:29:43 +0800
+Date: Wed, 12 Aug 2026 10:41:23 +0800
 Subject: [PATCH] sched: hydra: Introduce High-Yield Dynamic Render Affinity
- (v0.7)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+ (v0.8)
 
-v0.6:
-- Fix big-core topology detection race at late_initcall
-- Remove Smart Mode cold-start affinity gap
-- Move fork-triggered optimize to dedicated HIGHPRI workqueue
-- Log set_cpus_allowed_ptr() failures instead of ignoring them
-- Take pi_lock when snapshotting original cpumask
-- Synchronize hydra_big_cores reads in smart worker and stats handler against hydra_topo_mutex
-- Fix remaining unprotected hydra_big_cores read in hydra_optimize_threads()
-
-v0.7:
-- Generalize big/little detection into N-cluster detection (hydra_clusters[])
-- Add hydra_cluster_depth sysctl (default: auto — pins every tier except
-  little, scales correctly to 3/4-cluster SoCs instead of shrinking to a
-  single topmost core)
-- Extend hydra_stats with per-cluster detail
-- Add CONFIG_SCHED_HYDRA_DEBUG-gated hydra_debug_fake_clusters for testing
-  without physical 3/4-cluster hardware
+v0.8:
+- Implement CPU Hotplug Awareness via cpuhp_setup_state
+- Implement Dynamic Runtime Thread Matching via sysctl hydra_thread_patterns
+- Implement uclamp integration for Frequency Boosting
 ---
- include/linux/sched/hydra.h |  65 +++
- init/Kconfig                |  15 +
- kernel/sched/Makefile       |   1 +
- kernel/sched/hydra.c        | 953 ++++++++++++++++++++++++++++++++++++
- 4 files changed, 1034 insertions(+)
+ include/linux/sched/hydra.h |   45 ++
+ init/Kconfig                |   16 +-
+ kernel/sched/Makefile       |    1 +
+ kernel/sched/hydra.c        | 1026 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 1087 insertions(+), 1 deletion(-)
  create mode 100644 include/linux/sched/hydra.h
  create mode 100644 kernel/sched/hydra.c
 
 diff --git a/include/linux/sched/hydra.h b/include/linux/sched/hydra.h
 new file mode 100644
-index 0000000..636349c
+index 0000000..2c18060
 --- /dev/null
 +++ b/include/linux/sched/hydra.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,45 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_SCHED_HYDRA_H
 +#define _LINUX_SCHED_HYDRA_H
@@ -50,7 +34,7 @@ index 0000000..636349c
 +
 +#define SCHED_HYDRA_AUTHOR   "xMikkkaa"
 +#define SCHED_HYDRA_PROGNAME "HYDRA Game Thread Optimizer"
-+#define SCHED_HYDRA_VERSION  "0.7"
++#define SCHED_HYDRA_VERSION  "0.8"
 +
 +#define HYDRA_MAX_CLUSTERS 4
 +
@@ -66,12 +50,8 @@ index 0000000..636349c
 +#define hydra_cpus_allowed(t) ((t)->cpus_allowed)
 +#endif
 +
-+/*
-+ * Thread comm patterns matched by HYDRA.
-+ * To add new patterns, append to this array and rebuild the kernel.
-+ * Matching uses strnstr() against the task's comm string.
-+ */
-+static const char * const hydra_comm_patterns[] = {
++/* Static Thread Pattern Matching */
++static const char *hydra_comm_patterns[] = {
 +	"RenderThread",
 +	"UnityMain",
 +	"UnityGfx",
@@ -81,10 +61,8 @@ index 0000000..636349c
 +	"glthread",
 +	"kgsl",
 +	"ANGLE",
-+	"FrameWorker",
++	"FrameWorker"
 +};
-+
-+#define HYDRA_NUM_COMM_PATTERNS ARRAY_SIZE(hydra_comm_patterns)
 +
 +struct hydra_thread_state {
 +	pid_t tid;
@@ -105,10 +83,11 @@ index 0000000..636349c
 +
 +#endif /* _LINUX_SCHED_HYDRA_H */
 diff --git a/init/Kconfig b/init/Kconfig
-index 1ee3e4a..f81ceac 100644
+index 1ee3e4a..5f7a980 100644
 --- a/init/Kconfig
 +++ b/init/Kconfig
-@@ -2,3 +2,18 @@ config SCHED_DEBUG
+@@ -1,4 +1,18 @@
+-config SCHED_DEBUG
  	  say Y to "Magic SysRq key" and "Magic SysRq key over serial".
  	  See <file:Documentation/admin-guide/sysrq.rst> for more details.
  	  Don't say Y unless you really know what this hack does.
@@ -128,7 +107,7 @@ index 1ee3e4a..f81ceac 100644
 +	  Enable debug features for HYDRA, such as the fake cluster topology
 +	  sysctl. Only enable this for development/testing.
 diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
-index e8527cd..22385a4 100644
+index e8527cd..a52ba56 100644
 --- a/kernel/sched/Makefile
 +++ b/kernel/sched/Makefile
 @@ -1,2 +1,3 @@
@@ -137,10 +116,10 @@ index e8527cd..22385a4 100644
 +obj-$(CONFIG_SCHED_HYDRA) += hydra.o
 diff --git a/kernel/sched/hydra.c b/kernel/sched/hydra.c
 new file mode 100644
-index 0000000..2d91157
+index 0000000..4d8fde4
 --- /dev/null
 +++ b/kernel/sched/hydra.c
-@@ -0,0 +1,953 @@
+@@ -0,0 +1,1026 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * High-Yield Dynamic Render Affinity (HYDRA) Thread Optimizer
@@ -170,6 +149,11 @@ index 0000000..2d91157
 +#include <linux/ratelimit.h>
 +#include <linux/cpufreq.h>
 +#include <linux/seq_file.h>
++#include <linux/cpuhotplug.h>
++#include <linux/slab.h>
++#if defined(CONFIG_UCLAMP_TASK)
++#include <uapi/linux/sched/types.h>
++#endif
 +#include <trace/events/sched.h>
 +#include "sched.h"
 +
@@ -185,6 +169,9 @@ index 0000000..2d91157
 +int sched_hydra_heavy_util = 300;
 +int sched_hydra_light_util = 100;
 +int sched_hydra_cluster_depth = 0;
++int sched_hydra_uclamp_min = 0;
++char sched_hydra_thread_patterns[256] = "";
++
 +
 +#ifdef CONFIG_SCHED_HYDRA_DEBUG
 +char hydra_debug_fake_clusters[128] = "";
@@ -343,13 +330,34 @@ index 0000000..2d91157
 +static bool hydra_match_thread(struct task_struct *t)
 +{
 +	int i;
++	char *patterns;
++	char *token, *rest;
++	bool matched = false;
 +
-+	for (i = 0; i < HYDRA_NUM_COMM_PATTERNS; i++) {
++	/* 1. Check static patterns first */
++	for (i = 0; i < ARRAY_SIZE(hydra_comm_patterns); i++) {
 +		if (strnstr(t->comm, hydra_comm_patterns[i], TASK_COMM_LEN))
 +			return true;
 +	}
 +
-+	return false;
++	/* 2. Check dynamic patterns if configured */
++	if (strlen(sched_hydra_thread_patterns) == 0)
++		return false;
++
++	patterns = kstrdup(sched_hydra_thread_patterns, GFP_KERNEL);
++	if (!patterns)
++		return false;
++
++	rest = patterns;
++	while ((token = strsep(&rest, ",")) != NULL) {
++		token = strim(token);
++		if (strlen(token) > 0 && strnstr(t->comm, token, TASK_COMM_LEN)) {
++			matched = true;
++			break;
++		}
++	}
++	kfree(patterns);
++	return matched;
 +}
 +
 +/* ======================== Revert logic =================================== */
@@ -387,6 +395,16 @@ index 0000000..2d91157
 +		if (t) {
 +			int err;
 +			set_user_nice(t, state->original_nice);
++#if defined(CONFIG_UCLAMP_TASK)
++			if (sched_hydra_uclamp_min > 0) {
++				struct sched_attr attr;
++				memset(&attr, 0, sizeof(attr));
++				attr.size = sizeof(attr);
++				attr.sched_util_min = 0;
++				attr.sched_flags = SCHED_FLAG_UTIL_CLAMP_MIN;
++				sched_setattr(t, &attr);
++			}
++#endif
 +			err = set_cpus_allowed_ptr(t, &state->original_mask);
 +			if (err)
 +				pr_warn_ratelimited("hydra: affinity set failed for tid %d (err=%d)\n",
@@ -517,8 +535,19 @@ index 0000000..2d91157
 +			raw_spin_unlock_irqrestore(&t->pi_lock, flags);
 +		}
 +
++
 +		/* Nice boost is always applied regardless of cpumask availability */
 +		set_user_nice(t, sched_hydra_nice);
++#if defined(CONFIG_UCLAMP_TASK)
++		if (sched_hydra_uclamp_min > 0) {
++			struct sched_attr attr;
++			memset(&attr, 0, sizeof(attr));
++			attr.size = sizeof(attr);
++			attr.sched_util_min = sched_hydra_uclamp_min;
++			attr.sched_flags = SCHED_FLAG_UTIL_CLAMP_MIN;
++			sched_setattr(t, &attr);
++		}
++#endif
 +
 +		/* Cpumask assignment only when big cores are online */
 +		if (sched_hydra_smart_mode == 1 && has_big_cores) {
@@ -672,6 +701,17 @@ index 0000000..2d91157
 +}
 +
 +/* ======================== Tracepoint probes ============================== */
++
++static void hydra_queue_work(struct work_struct *work);
++
++static int hydra_cpu_hotplug_callback(unsigned int cpu)
++{
++	int pid = READ_ONCE(sched_hydra_pid);
++	if (pid > 0 && static_branch_likely(&sched_hydra_enable_key))
++		hydra_queue_work(&hydra_fork_work); /* Re-evaluates cpumask */
++	return 0;
++}
++
 +
 +static void hydra_queue_work(struct work_struct *work)
 +{
@@ -991,9 +1031,33 @@ index 0000000..2d91157
 +}
 +#endif
 +
++
++static int sched_hydra_patterns_handler(struct ctl_table *table, int write,
++				     void __user *buffer, size_t *lenp,
++				     loff_t *ppos)
++{
++	if (write && !capable(CAP_SYS_NICE))
++		return -EPERM;
++	return proc_dostring(table, write, buffer, lenp, ppos);
++}
++
 +/* ======================== Sysctl table =================================== */
 +
 +static struct ctl_table hydra_sysctls[] = {
++	{
++		.procname	= "hydra_thread_patterns",
++		.data		= sched_hydra_thread_patterns,
++		.maxlen		= sizeof(sched_hydra_thread_patterns),
++		.mode		= 0644,
++		.proc_handler	= sched_hydra_patterns_handler,
++	},
++	{
++		.procname	= "hydra_uclamp_min",
++		.data		= &sched_hydra_uclamp_min,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= sched_hydra_simple_int_handler,
++	},
 +	{
 +		.procname	= "hydra_enable",
 +		.data		= &sched_hydra_enable,
@@ -1077,9 +1141,14 @@ index 0000000..2d91157
 +{
 +	hydra_detect_clusters();
 +
++
 +	hydra_wq = alloc_workqueue("hydra", WQ_HIGHPRI, 0);
 +	if (!hydra_wq)
 +		pr_err("hydra: failed to allocate high-priority workqueue, falling back to system_wq\n");
++
++	cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "sched/hydra:online",
++				  hydra_cpu_hotplug_callback,
++				  hydra_cpu_hotplug_callback);
 +
 +	INIT_WORK(&hydra_fork_work, hydra_fork_work_fn);
 +	INIT_WORK(&hydra_exit_work, hydra_exit_work_fn);
