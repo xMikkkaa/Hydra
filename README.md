@@ -29,7 +29,7 @@ When a game PID is written to `hydra_pid`, HYDRA scans the process and its threa
 
 ## Requirements
 - Android kernel source tree (msm-4.9, msm-4.14, msm-4.19, msm-5.4, or msm-5.10)
-- ARM64 architecture (designed for SDM845, works on other Qualcomm SoCs with big.LITTLE)
+- ARM64 architecture (designed for SDM845, works on other Qualcomm SoCs with multi-cluster topologies like big.LITTLE or 1+3+4 Prime/big/LITTLE)
 - Root access
 - `CONFIG_SCHED_HYDRA=y` in your defconfig
 - Recommended: [Aozora Kernel Manager](https://github.com/xMikkkaa/Aozora-Kernel-Manager) for automated game detection
@@ -39,7 +39,7 @@ When a game PID is written to `hydra_pid`, HYDRA scans the process and its threa
 2. Apply the patch to your kernel tree:
    ```bash
    cd your-kernel-tree
-   git apply path/to/patches/testing/0001-sched-hydra-Introduce-High-Yield-Dynamic-Render-Affinity.patch
+   git apply path/to/patches/testing/0001-android-msm-hydra-0.8.patch
    ```
    > **Note**: If `git apply` fails due to context mismatch in `init/Kconfig` or `kernel/sched/Makefile` on custom kernels, you can safely skip patching those two files and add them manually:
    > 1. In `kernel/sched/Makefile`, append this line anywhere: `obj-$(CONFIG_SCHED_HYDRA) += hydra.o`
@@ -88,6 +88,9 @@ All tunables are located under `/proc/sys/kernel/`:
 | `hydra_heavy_util` | `300` | `0-1024` | Utilization above this pins the thread to big cores. |
 | `hydra_light_util` | `100` | `0-1024` | Utilization below this restores the original cpumask. |
 | `hydra_stats` | *(read-only)* | - | Shows: tracked threads, mode, throttle state, active PID, version. |
+| `hydra_cluster_depth` | `0` | `0` to `max_clusters-1` | Number of top clusters to pin (0 = auto, pins all except little). |
+| `hydra_thread_patterns`| `RenderThread,...` | String | Comma-separated list of thread names to match dynamically. |
+| `hydra_uclamp_min` | `0` | `0-1024` | uclamp_min value to boost matched threads (0 = disable). |
 
 **IMPORTANT**: `hydra_light_util` must be ≤ `hydra_heavy_util`. The gap between these two values acts as a hysteresis zone where the thread maintains its current state, intentionally preventing cpumask thrashing.
 
@@ -101,30 +104,29 @@ All tunables are located under `/proc/sys/kernel/`:
   - If big core freq < `throttle_freq` → all threads get original cpumask (thermal protection).
 
 ## Thread Matching
-HYDRA searches for the following comm patterns:
-- `RenderThread`, `UnityMain`, `UnityGfx`, `TaskGraph`, `GameThread`
-- `adreno`, `glthread`, `kgsl`, `ANGLE`, `FrameWorker`
+HYDRA uses a **hybrid matching architecture**:
+1. **Static Patterns**: It first checks against a built-in list of common game threads (`RenderThread`, `UnityMain`, `UnityGfx`, `TaskGraph`, `GameThread`, `adreno`, `glthread`, `kgsl`, `ANGLE`, `FrameWorker`).
+2. **Dynamic Patterns**: If the thread doesn't match the static list, it checks against dynamically configured patterns from `/proc/sys/kernel/hydra_thread_patterns`.
 
-Matching uses `strnstr()` on the task comm. To add new patterns, edit the `hydra_comm_patterns[]` array in `hydra.h` and rebuild your kernel.
+By default, the dynamic pattern sysctl is empty (`""`). Userspace daemons (like Aozora Kernel Manager) can safely inject new game-specific threads into the sysctl without accidentally overriding or deleting the static core patterns.
+
+Matching uses `strnstr()` on the task comm. To add new patterns, simply write a comma-separated string to the sysctl interface.
 
 ## Security
 - All sysctl writes require `CAP_SYS_NICE`.
-- HYDRA only modifies nice values and cpumasks — no privilege escalation is possible.
+- HYDRA only modifies nice values, uclamp, and cpumasks — no privilege escalation is possible.
 - Thread manipulation happens in workqueue context, not interrupt or probe context.
 - Identity validation (using TID + start_time) prevents accidental manipulation of the wrong threads (e.g., PID recycling).
 
 ## Known Limitations
-- Comm pattern matching is done at compile-time (no runtime configuration).
 - Big core detection uses `capacity_orig_of()`, requiring a properly configured CPU topology.
 - Maximum of 64 tracked threads per game (`HYDRA_MAX_TRACKED_THREADS`).
 - Smart mode polling occurs at 500ms intervals, which is not sub-frame granularity.
 
 ## Roadmap
 - Per-thread profiles (treating `RenderThread` vs `GameThread` differently).
-- `uclamp` integration for frequency boosting.
 - Engine auto-detection (Unity/Unreal/native).
 - `debugfs`/tracepoint observability (`trace_hydra_thread_boost`).
-- Runtime-configurable comm patterns via sysctl.
 
 ## License
 GPL-2.0. Copyright (C) 2026 xMikkkaa.
